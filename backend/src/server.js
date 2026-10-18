@@ -1,0 +1,11 @@
+import 'dotenv/config';
+import express from 'express'; import cors from 'cors'; import helmet from 'helmet'; import http from 'node:http'; import { Server } from 'socket.io';
+import { api, setIo } from './routes/api.js'; import { errors } from './middleware.js'; import { query } from './db.js';
+if(process.env.NODE_ENV==='production'&&(!process.env.JWT_SECRET||process.env.JWT_SECRET.length<32||!process.env.DEVICE_API_KEY||process.env.DEVICE_API_KEY.length<24))throw new Error('En producción define JWT_SECRET (32+ caracteres) y DEVICE_API_KEY (24+ caracteres).');
+const origins=(process.env.FRONTEND_ORIGIN||'http://localhost:5173').split(',').map(x=>x.trim());
+const app=express();const server=http.createServer(app);const io=new Server(server,{cors:{origin:origins}});setIo(io);
+app.use(helmet());app.use(cors({origin:origins}));app.use(express.json({limit:'256kb'}));
+app.get('/health',async(req,res)=>{try{await query('SELECT 1');res.json({status:'ok',database:'connected',time:new Date().toISOString()})}catch{res.status(503).json({status:'degraded',database:'unavailable'})}});
+app.use('/api/v1',api);app.use(errors);
+const port=Number(process.env.PORT||8080);server.listen(port,'0.0.0.0',()=>console.log(`API lista en puerto ${port}`));
+process.on('SIGTERM',()=>server.close());

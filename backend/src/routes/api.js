@@ -1,0 +1,55 @@
+import { Router } from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { query, pool } from '../db.js';
+import { auth, allow, deviceAuth } from '../middleware.js';
+import { evaluate } from '../services/traffic.js';
+export const api = Router();
+let io;
+export const setIo = value => { io = value; };
+const fail = (status, code, message) => Object.assign(new Error(message), { status, code });
+async function audit(userId, action, entity, id, detail={}) { await query('INSERT INTO audit_log(user_id,action,entity,entity_id,detail) VALUES($1,$2,$3,$4,$5)', [userId, action, entity, id == null ? null : String(id), JSON.stringify(detail)]); }
+
+api.post('/auth/login', async (req,res,next) => { try {
+  const { email, password }=req.body||{}; if(!email||!password) throw fail(400,'INVALID_INPUT','Correo y contraseña son obligatorios.');
+  const {rows}=await query('SELECT id,name,email,password_hash,role,active FROM app_users WHERE lower(email)=lower($1)',[email]); const u=rows[0];
+  if(!u||!u.active||!await bcrypt.compare(password,u.password_hash)) throw fail(401,'INVALID_CREDENTIALS','Correo o contraseña incorrectos.');
+  const token=jwt.sign({id:u.id,name:u.name,email:u.email,role:u.role},process.env.JWT_SECRET,{expiresIn:'12h'}); await audit(u.id,'login','user',u.id);
+  res.json({token,user:{id:u.id,name:u.name,email:u.email,role:u.role}});
+} catch(e){next(e)} });
+api.get('/auth/me',auth,(req,res)=>res.json({user:req.user}));
+api.post('/users',auth,allow('admin'),async(req,res,next)=>{try{const{name,email,password,role='operator'}=req.body||{}; if(!name||!email||!password||password.length<10)throw fail(400,'INVALID_INPUT','Completa nombre, correo y contraseña (mínimo 10 caracteres).'); if(!['admin','supervisor','operator'].includes(role))throw fail(400,'INVALID_ROLE','Rol inválido.'); const hash=await bcrypt.hash(password,12); const {rows}=await query('INSERT INTO app_users(name,email,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id,name,email,role,active',[name,email,hash,role]); await audit(req.user.id,'create','user',rows[0].id);res.status(201).json(rows[0]);}catch(e){next(e)}});
+
+api.get('/dashboard',auth,async(req,res,next)=>{try{
+  const [ix,sens,alerts,incidents,states]=await Promise.all([
+    query('SELECT * FROM intersections ORDER BY id'),query(`SELECT status,count(*)::int AS count FROM sensors GROUP BY status`),
+    query("SELECT count(*)::int AS count FROM alerts WHERE status IN ('open','acknowledged')"),query('SELECT count(*)::int AS count FROM incidents'),
+    query('SELECT * FROM signal_state')]);
+  res.json({intersections:ix.rows,sensors:sens.rows,activeAlerts:alerts.rows[0].count,incidents:incidents.rows[0].count,signals:states.rows});
+}catch(e){next(e)}});
+api.get('/intersections',auth,async(req,res,next)=>{try{const {rows}=await query(`SELECT i.*, count(DISTINCT s.id)::int AS sensor_count, ss.active_direction, ss.mode AS signal_mode, ss.reason AS signal_reason
+FROM intersections i LEFT JOIN sensors s ON s.intersection_id=i.id LEFT JOIN signal_state ss ON ss.intersection_id=i.id GROUP BY i.id,ss.active_direction,ss.mode,ss.reason ORDER BY i.id`);res.json(rows)}catch(e){next(e)}});
+api.post('/intersections',auth,allow('admin','supervisor'),async(req,res,next)=>{try{const{name,location='',description=''}=req.body||{};if(!name)throw fail(400,'INVALID_INPUT','El nombre es obligatorio.');const {rows}=await query('INSERT INTO intersections(name,location,description) VALUES($1,$2,$3) RETURNING *',[name,location,description]);await query('INSERT INTO signal_state(intersection_id) VALUES($1)',[rows[0].id]);await audit(req.user.id,'create','intersection',rows[0].id);res.status(201).json(rows[0])}catch(e){next(e)}});
+api.patch('/intersections/:id',auth,allow('admin','supervisor'),async(req,res,next)=>{try{const{name,location,description,status}=req.body||{};const {rows}=await query(`UPDATE intersections SET name=COALESCE($2,name),location=COALESCE($3,location),description=COALESCE($4,description),status=COALESCE($5,status) WHERE id=$1 RETURNING *`,[req.params.id,name,location,description,status]);if(!rows[0])throw fail(404,'NOT_FOUND','Intersección no encontrada.');await audit(req.user.id,'update','intersection',req.params.id,req.body);res.json(rows[0])}catch(e){next(e)}});
+api.get('/sensors',auth,async(req,res,next)=>{try{const {rows}=await query(`SELECT s.*,i.name AS intersection_name,m.distance_cm,m.vehicle_present,m.measured_at FROM sensors s JOIN intersections i ON i.id=s.intersection_id LEFT JOIN LATERAL(SELECT distance_cm,vehicle_present,measured_at FROM measurements WHERE sensor_id=s.id ORDER BY measured_at DESC LIMIT 1)m ON true ORDER BY s.id`);res.json(rows)}catch(e){next(e)}});
+api.post('/sensors',auth,allow('admin','supervisor'),async(req,res,next)=>{try{const{intersectionId,name,zone='',kind='ultrasonic'}=req.body||{};if(!intersectionId||!name)throw fail(400,'INVALID_INPUT','Intersección y nombre son obligatorios.');const{rows}=await query('INSERT INTO sensors(intersection_id,name,zone,kind) VALUES($1,$2,$3,$4) RETURNING *',[intersectionId,name,zone,kind]);await audit(req.user.id,'create','sensor',rows[0].id);res.status(201).json(rows[0])}catch(e){next(e)}});
+api.post('/telemetry/ingest',deviceAuth,async(req,res,next)=>{try{
+  const {sensorId,distanceCm,vehiclePresent,measuredAt,source='device'}=req.body||{};if(!sensorId||typeof vehiclePresent!=='boolean')throw fail(400,'INVALID_INPUT','Se requiere sensorId y vehiclePresent booleano.');
+  const client=await pool.connect();let intersectionId;try{await client.query('BEGIN');const s=await client.query("UPDATE sensors SET last_seen=now(),status='active' WHERE id=$1 RETURNING intersection_id",[sensorId]);if(!s.rows[0])throw fail(404,'SENSOR_NOT_FOUND','Sensor no registrado.');intersectionId=s.rows[0].intersection_id;
+  await client.query('INSERT INTO measurements(sensor_id,distance_cm,vehicle_present,measured_at,raw) VALUES($1,$2,$3,COALESCE($4::timestamptz,now()),$5)',[sensorId,distanceCm??null,vehiclePresent,measuredAt??null,JSON.stringify({source})]);await client.query('COMMIT');}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
+  const signal=await evaluate(intersectionId);
+  if(signal.demand.A&&signal.demand.B){
+    const existing=await query("SELECT id FROM alerts WHERE intersection_id=$1 AND title='Demanda simultánea en ambas vías' AND status IN ('open','acknowledged') AND created_at>now()-interval '5 minutes' LIMIT 1",[intersectionId]);
+    if(!existing.rows.length){const created=await query("INSERT INTO alerts(intersection_id,severity,title,detail) VALUES($1,'medium','Demanda simultánea en ambas vías','Se detectó presencia reciente de vehículos en las vías A y B; requiere supervisión del operador.') RETURNING *",[intersectionId]);io?.emit('alert',created.rows[0]);}
+  }
+  const payload={sensorId,intersectionId,distanceCm:distanceCm??null,vehiclePresent,measuredAt:measuredAt||new Date().toISOString(),signal};io?.emit('telemetry',payload);io?.emit('dashboard:refresh');res.status(201).json({accepted:true,signal});
+}catch(e){next(e)}});
+api.get('/signals',auth,async(req,res,next)=>{try{const {rows}=await query('SELECT i.id AS intersection_id,i.name,ss.* FROM intersections i LEFT JOIN signal_state ss ON ss.intersection_id=i.id ORDER BY i.id');res.json(rows)}catch(e){next(e)}});
+api.patch('/signals/:intersectionId',auth,allow('admin','supervisor','operator'),async(req,res,next)=>{try{const{direction,mode='manual'}=req.body||{};if(!['A','B'].includes(direction)||!['manual','auto'].includes(mode))throw fail(400,'INVALID_INPUT','Dirección o modo inválido.');const{rows}=await query(`INSERT INTO signal_state(intersection_id,active_direction,mode,reason,changed_at) VALUES($1,$2,$3,'Cambio manual por operador',now()) ON CONFLICT(intersection_id) DO UPDATE SET active_direction=$2,mode=$3,reason='Cambio manual por operador',changed_at=now() RETURNING *`,[req.params.intersectionId,direction,mode]);if(!rows[0])throw fail(404,'NOT_FOUND','Intersección no encontrada.');await audit(req.user.id,'change','signal_state',req.params.intersectionId,{direction,mode});io?.emit('dashboard:refresh');res.json(rows[0])}catch(e){next(e)}});
+api.get('/alerts',auth,async(req,res,next)=>{try{const{rows}=await query('SELECT a.*,i.name AS intersection_name FROM alerts a LEFT JOIN intersections i ON i.id=a.intersection_id ORDER BY a.created_at DESC LIMIT 250');res.json(rows)}catch(e){next(e)}});
+api.patch('/alerts/:id',auth,async(req,res,next)=>{try{const{status}=req.body||{};if(!['acknowledged','attended','closed'].includes(status))throw fail(400,'INVALID_STATUS','Estado de alerta inválido.');const{rows}=await query('UPDATE alerts SET status=$2,updated_at=now() WHERE id=$1 RETURNING *',[req.params.id,status]);if(!rows[0])throw fail(404,'NOT_FOUND','Alerta no encontrada.');await audit(req.user.id,status,'alert',req.params.id);io?.emit('dashboard:refresh');res.json(rows[0])}catch(e){next(e)}});
+api.post('/alerts',auth,allow('admin','supervisor','operator'),async(req,res,next)=>{try{const{intersectionId,severity='medium',title,detail=''}=req.body||{};if(!title||!['low','medium','high','critical'].includes(severity))throw fail(400,'INVALID_INPUT','Título o gravedad inválidos.');const{rows}=await query('INSERT INTO alerts(intersection_id,severity,title,detail) VALUES($1,$2,$3,$4) RETURNING *',[intersectionId||null,severity,title,detail]);if(severity==='critical')await query('INSERT INTO incidents(alert_id,intersection_id,description) VALUES($1,$2,$3)',[rows[0].id,intersectionId||null,detail||title]);await audit(req.user.id,'create','alert',rows[0].id);io?.emit('alert',rows[0]);res.status(201).json(rows[0])}catch(e){next(e)}});
+api.get('/incidents',auth,async(req,res,next)=>{try{const{rows}=await query(`SELECT n.*,i.name AS intersection_name FROM incidents n LEFT JOIN intersections i ON i.id=n.intersection_id ORDER BY n.created_at DESC LIMIT 500`);res.json(rows)}catch(e){next(e)}});
+api.patch('/incidents/:id',auth,allow('admin','supervisor','operator'),async(req,res,next)=>{try{const{classification,notes}=req.body||{};if(classification&&!['real','false_positive','review'].includes(classification))throw fail(400,'INVALID_INPUT','Clasificación inválida.');const{rows}=await query('UPDATE incidents SET classification=COALESCE($2,classification),notes=COALESCE($3,notes) WHERE id=$1 RETURNING *',[req.params.id,classification,notes]);if(!rows[0])throw fail(404,'NOT_FOUND','Incidente no encontrado.');await audit(req.user.id,'update','incident',req.params.id,req.body);res.json(rows[0])}catch(e){next(e)}});
+api.get('/reports/summary',auth,async(req,res,next)=>{try{const{rows}=await query(`SELECT date_trunc('day',created_at) AS day,severity,count(*)::int AS count FROM alerts WHERE created_at >= now()-interval '30 days' GROUP BY 1,2 ORDER BY 1`);res.json(rows)}catch(e){next(e)}});
+api.get('/audit',auth,allow('admin','supervisor'),async(req,res,next)=>{try{const{rows}=await query('SELECT a.*,u.name AS user_name FROM audit_log a LEFT JOIN app_users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 300');res.json(rows)}catch(e){next(e)}});
